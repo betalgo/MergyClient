@@ -2,6 +2,11 @@
 
 Mergy Client is a C# console application that provides a question-answering system using the Anthropic AI service. It allows users to interact with an AI model based on a provided knowledge base.
 
+## Links:
+- [Youtube video](https://www.youtube.com/watch?v=4gbvmFCAN0E) 
+- [Blog Post](https://blog.kayhantolga.com/mergy-a-quick-tool-for-claude-projects)
+- [Mergy](https://github.com/betalgo/Mergy)
+
 ## Features
 
 - Loads a custom knowledge base from a file
