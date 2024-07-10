@@ -1,0 +1,683 @@
+// File: popup.js
+document.addEventListener('DOMContentLoaded', function() {
+ const repoInfoElement = document.getElementById('repo-info');
+ const githubTokenInput = document.getElementById('github-token');
+ const saveTokenButton = document.getElementById('save-token');
+ const startFetchButton = document.getElementById('start-fetch');
+ const fileTableBody = document.getElementById('file-table-body');
+ const downloadFilesButton = document.getElementById('download-files');
+ const settingsToggleButton = document.getElementById('settings-toggle');
+ const settingsPanel = document.getElementById('settings-panel');
+ const saveRulesButton = document.getElementById('save-rules');
+ const downloadSection = document.getElementById('download-section');
+ const estimatedSizeSpan = document.getElementById('estimated-size');
+ const fileList = document.getElementById('file-list');
+ const loadingIndicator = document.getElementById('loading');
+ const mainContent = document.getElementById('main-content');
+
+ const mergyignoreInputs = {
+ includePath: document.getElementById('include-path'),
+ includeExtension: document.getElementById('include-extension'),
+ excludePath: document.getElementById('exclude-path'),
+ excludeExtension: document.getElementById('exclude-extension')
+ };
+
+ let currentRepo = null;
+ let fetchedFiles = [];
+
+ // Load saved token and check if settings should be shown
+ chrome.storage.sync.get(['githubToken', 'mergyignoreRules'], function(result) {
+ if (result.githubToken) {
+ githubTokenInput.value = result.githubToken;
+ settingsPanel.style.display = 'none';
+ } else {
+ settingsPanel.style.display = 'block';
+ }
+
+ if (result.mergyignoreRules) {
+ const rules = JSON.parse(result.mergyignoreRules);
+ mergyignoreInputs.includePath.value = rules.includePath.join('\n');
+ mergyignoreInputs.includeExtension.value = rules.includeExtension.join('\n');
+ mergyignoreInputs.excludePath.value = rules.excludePath.join('\n');
+ mergyignoreInputs.excludeExtension.value = rules.excludeExtension.join('\n');
+ } else {
+ // Set default exclude rules
+ mergyignoreInputs.excludePath.value = 'bin\nobj\nnode_modules\nbuild\ndist\n.git';
+ mergyignoreInputs.excludeExtension.value = '.jpg\n.jpeg\n.png\n.gif\n.bmp\n.tiff\n.ico\n.svg\n.webp\n.mp4\n.avi\n.mov\n.wmv\n.flv\n.ogg\n.mp3\n.wav\n.flac\n.pdf\n.doc\n.docx\n.xls\n.xlsx\n.ppt\n.pptx\n.zip\n.rar\n.tar\n.gz\n.7z\n.exe\n.dll\n.so\n.dylib\n.class\n.pyc\n.pyo\n.o\n.obj\n.lib\n.a\n.jar\n.war\n.ear\n.db\n.sqlite\n.sqlite3\n.mdf\n.ldf\n.bak\n.tmp\n.temp\n.swp\n.DS_Store\n.lock\n.log';
+ }
+ });
+
+ // Toggle settings panel
+ settingsToggleButton.addEventListener('click', function() {
+ if (settingsPanel.style.display === 'none') {
+ settingsPanel.style.display = 'block';
+ mainContent.style.display = 'none';
+ fileList.style.display = 'none';
+ downloadFilesButton.style.display = 'none';
+ clearFetchedFiles();
+ } else {
+ settingsPanel.style.display = 'none';
+ mainContent.style.display = 'block';
+ }
+ });
+
+ function clearFetchedFiles() {
+ fetchedFiles = [];
+ fileTableBody.innerHTML = '';
+ estimatedSizeSpan.textContent = '';
+ }
+
+ // Save token
+ saveTokenButton.addEventListener('click', function() {
+ const token = githubTokenInput.value.trim();
+ if (token) {
+ chrome.storage.sync.set({githubToken: token}, function() {
+ chrome.runtime.sendMessage({action: 'setToken', token: token}, function(response) {
+ if (response && response.success) {
+ alert('GitHub token saved and set!');
+ } else {
+ alert('Error setting token in background script.');
+ }
+ });
+ });
+ } else {
+ alert('Please enter a valid GitHub token.');
+ }
+ });
+
+ // Save MergyIgnore rules
+ saveRulesButton.addEventListener('click', function() {
+ const rules = {
+ includePath: mergyignoreInputs.includePath.value.split('\n').filter(Boolean),
+ includeExtension: mergyignoreInputs.includeExtension.value.split('\n').filter(Boolean),
+ excludePath: mergyignoreInputs.excludePath.value.split('\n').filter(Boolean),
+ excludeExtension: mergyignoreInputs.excludeExtension.value.split('\n').filter(Boolean)
+ };
+ chrome.storage.sync.set({mergyignoreRules: JSON.stringify(rules)}, function() {
+ alert('MergyIgnore rules saved!');
+ });
+ });
+
+ // Display files in the table
+ function displayFiles(files) {
+ fileTableBody.innerHTML = '';
+ files.forEach(file => {
+ const row = document.createElement('tr');
+ row.innerHTML = `
+ <td><input type="checkbox" checked data-path="${file.path}"></td>
+ <td>${formatFileSize(file.size)}</td>
+ <td title="${file.name}">${file.name}</td>
+ <td title="${file.path}">${file.path}</td>
+ `;
+ row.querySelector('input[type="checkbox"]').addEventListener('change', updateEstimatedSize);
+ fileTableBody.appendChild(row);
+ });
+ }
+
+ // Update estimated size
+ function updateEstimatedSize() {
+ const selectedFiles = Array.from(fileTableBody.querySelectorAll('input[type="checkbox"]:checked'))
+ .map(checkbox => fetchedFiles.find(file => file.path === checkbox.dataset.path));
+ const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+ estimatedSizeSpan.textContent = `Estimated size: ${formatFileSize(totalSize)}`;
+ }
+
+ // Download combined files
+startFetchButton.addEventListener('click', function() {
+ if (!currentRepo) {
+ alert('No repository detected. Please navigate to a GitHub repository page.');
+ return;
+ }
+
+ showLoading(true);
+ fileList.style.display = 'none';
+ downloadFilesButton.style.display = 'none';
+ clearFetchedFiles();
+
+ chrome.storage.sync.get(['githubToken', 'mergyignoreRules'], function(result) {
+ if (!result.githubToken) {
+ showLoading(false);
+ alert('GitHub token not set. Please set your Personal Access Token in the settings.');
+ return;
+ }
+
+ let rules;
+ try {
+ rules = result.mergyignoreRules ? JSON.parse(result.mergyignoreRules) : {};
+ } catch (e) {
+ console.error('Error parsing MergyIgnore rules:', e);
+ rules = {};
+ }
+
+ // Ensure all rule arrays exist
+ rules.includePath = rules.includePath || [];
+ rules.includeExtension = rules.includeExtension || [];
+ rules.excludePath = rules.excludePath || [];
+ rules.excludeExtension = rules.excludeExtension || [];
+
+ chrome.runtime.sendMessage({
+ action: 'fetchFiles',
+ repo: currentRepo,
+ mergyignoreRules: rules,
+ token: result.githubToken
+ }, function(response) {
+ showLoading(false);
+ if (response.error) {
+ alert(`Error: ${response.error}`);
+ } else if (response.files) {
+ fetchedFiles = response.files;
+ displayFiles(fetchedFiles);
+ updateEstimatedSize();
+ fileList.style.display = 'block';
+ downloadFilesButton.style.display = 'inline-flex';
+ }
+ });
+ });
+});
+
+ // Download combined files
+ downloadFilesButton.addEventListener('click', function() {
+ showLoading(true);
+ const selectedFiles = Array.from(fileTableBody.querySelectorAll('input[type="checkbox"]:checked'))
+ .map(checkbox => checkbox.dataset.path);
+
+ chrome.runtime.sendMessage({
+ action: 'downloadFiles',
+ repo: currentRepo,
+ files: selectedFiles
+ }, function(response) {
+ showLoading(false);
+ if (response.error) {
+ alert(`Error: ${response.error}`);
+ } else if (response.content) {
+ const blob = new Blob([response.content], {type: 'text/plain'});
+ const url = URL.createObjectURL(blob);
+ const a = document.createElement('a');
+ a.href = url;
+ a.download = `${currentRepo.owner}_${currentRepo.name}_combined.txt`;
+ document.body.appendChild(a);
+ a.click();
+ document.body.removeChild(a);
+ URL.revokeObjectURL(url);
+ }
+ });
+ });
+
+ function showLoading(show) {
+ loadingIndicator.style.display = show ? 'block' : 'none';
+ startFetchButton.disabled = show;
+ downloadFilesButton.disabled = show;
+ }
+
+ function formatFileSize(bytes) {
+ if (bytes === 0) return '0 Bytes';
+ const k = 1024;
+ const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+ const i = Math.floor(Math.log(bytes) / Math.log(k));
+ return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+ }
+
+ // Load repository information
+ chrome.tabs.query({active: true, currentWindow: true}, function(tabs) {
+ chrome.tabs.sendMessage(tabs[0].id, {action: "getRepoInfo"}, function(response) {
+ if (response && response.repo) {
+ currentRepo = response.repo;
+ repoInfoElement.textContent = `Repository: ${currentRepo.owner}/${currentRepo.name}`;
+ }
+ });
+ });
+});
+
+// File: background.js
+const API_BASE_URL = 'https://api.github.com';
+let githubToken = '';
+
+chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
+ if (request.action === 'setToken') {
+ githubToken = request.token;
+ sendResponse({success: true});
+ } else if (request.action === 'fetchFiles') {
+ githubToken = request.token;  // Set the token from the message
+ fetchRepoFiles(request.repo, request.mergyignoreRules)
+ .then(files => sendResponse({files: files}))
+ .catch(error => sendResponse({error: error.message}));
+ return true;
+ } else if (request.action === 'downloadFiles') {
+ combineAndDownloadFiles(request.repo, request.files)
+ .then(content => sendResponse({content: content}))
+ .catch(error => sendResponse({error: error.message}));
+ return true;
+ }
+});
+
+async function fetchRepoFiles(repo, mergyignoreRules) {
+ if (!githubToken) {
+ throw new Error('GitHub token not set. Please set your Personal Access Token.');
+ }
+ const files = await listRepoContents(repo, '', mergyignoreRules);
+ return files.sort((a, b) => b.size - a.size);
+}
+
+async function listRepoContents(repo, path = '', mergyignoreRules) {
+ const url = `${API_BASE_URL}/repos/${repo.owner}/${repo.name}/contents/${path}`;
+ const response = await fetch(url, {
+ headers: {
+ 'Accept': 'application/vnd.github.v3+json',
+ 'Authorization': `token ${githubToken}`
+ }
+ });
+
+ if (!response.ok) {
+ throw new Error(`GitHub API request failed: ${response.statusText}`);
+ }
+
+ const contents = await response.json();
+ let files = [];
+
+ for (const item of contents) {
+ const fullPath = path ? `${path}/${item.name}` : item.name;
+
+ if (shouldIncludeFile(fullPath, item.name, mergyignoreRules)) {
+ if (item.type === 'file') {
+ files.push({
+ name: item.name,
+ path: fullPath,
+ size: item.size,
+ downloadUrl: item.download_url
+ });
+ } else if (item.type === 'dir') {
+ const subFiles = await listRepoContents(repo, fullPath, mergyignoreRules);
+ files = files.concat(subFiles);
+ }
+ }
+ }
+
+ return files;
+}
+
+function shouldIncludeFile(fullPath, fileName, rules) {
+ const extension = '.' + fileName.split('.').pop();
+
+ // Ensure all rule arrays exist, if not, create empty arrays
+ rules.includePath = rules.includePath || [];
+ rules.includeExtension = rules.includeExtension || [];
+ rules.excludePath = rules.excludePath || [];
+ rules.excludeExtension = rules.excludeExtension || [];
+
+ // Check include rules
+ if (rules.includePath.length > 0 || rules.includeExtension.length > 0) {
+ const pathIncluded = rules.includePath.length === 0 || rules.includePath.some(path => fullPath.includes(path));
+ const extensionIncluded = rules.includeExtension.length === 0 || rules.includeExtension.includes(extension);
+ if (!pathIncluded || !extensionIncluded) {
+ return false;
+ }
+ }
+
+ // Check exclude rules
+ if (rules.excludePath.some(path => fullPath.includes(path))) {
+ return false;
+ }
+ if (rules.excludeExtension.includes(extension)) {
+ return false;
+ }
+
+ return true;
+}
+
+function parseMergyIgnoreRules(rulesString) {
+ return rulesString.split('\n')
+ .map(rule => rule.trim())
+ .filter(rule => rule && !rule.startsWith('#'))
+ .map(rule => new RegExp(rule.replace(/\*/g, '.*').replace(/\?/g, '.'), 'i'));
+}
+
+function shouldIgnore(path, ignorePatterns) {
+ return ignorePatterns.some(pattern => pattern.test(path));
+}
+
+async function combineAndDownloadFiles(repo, files) {
+ // Implement file combination and download
+ // This is a placeholder and needs to be implemented
+ console.log('Combining and downloading files:', files);
+ return 'download_url_placeholder';
+}
+async function combineAndDownloadFiles(repo, filePaths) {
+ let combinedContent = '';
+
+ for (const filePath of filePaths) {
+ const fileContent = await fetchFileContent(repo, filePath);
+ combinedContent += `// File: ${filePath}\n`;
+ combinedContent += fileContent;
+ combinedContent += '\n\n';
+ }
+
+ const optimizedContent = optimizeWhitespace(combinedContent);
+
+ // Instead of creating a Blob and URL here, we'll return the content
+ return optimizedContent;
+}
+
+async function fetchFileContent(repo, filePath) {
+ const url = `${API_BASE_URL}/repos/${repo.owner}/${repo.name}/contents/${filePath}`;
+ const response = await fetch(url, {
+ headers: {
+ 'Accept': 'application/vnd.github.v3.raw',
+ 'Authorization': `token ${githubToken}`
+ }
+ });
+
+ if (!response.ok) {
+ throw new Error(`Failed to fetch file content: ${response.statusText}`);
+ }
+
+ return await response.text();
+}
+
+function optimizeWhitespace(content) {
+ const lines = content.split('\n');
+ const optimizedLines = [];
+ let previousLineEmpty = false;
+
+ for (let line of lines) {
+ // Trim trailing whitespace
+ line = line.trimEnd();
+
+ // Remove leading whitespace, but keep a single space for indentation if present
+ const indent = line.match(/^\s+/);
+ if (indent) {
+ line = ' ' + line.trimStart();
+ }
+
+ if (line === '') {
+ if (!previousLineEmpty) {
+ optimizedLines.push('');
+ previousLineEmpty = true;
+ }
+ } else {
+ optimizedLines.push(line);
+ previousLineEmpty = false;
+ }
+ }
+
+ return optimizedLines.join('\n');
+}
+
+async function combineAndDownloadFiles(repo, filePaths) {
+ let combinedContent = '';
+
+ for (const filePath of filePaths) {
+ const fileContent = await fetchFileContent(repo, filePath);
+ combinedContent += `// File: ${filePath}\n`;
+ combinedContent += fileContent;
+ combinedContent += '\n\n';
+ }
+
+ return optimizeWhitespace(combinedContent);
+}
+
+// File: Styles.css
+body {
+ width: 600px;
+ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, Courier New, monospace;
+ padding: 20px;
+ background-color: #2c2c28;
+ color: #ffffff;
+}
+a:visited {
+ color: #ffffff;
+ font-weight: bold;
+}
+#header {
+ display: flex;
+ justify-content: space-between;
+ align-items: center;
+}
+
+h1, h2, h3 {
+ margin-bottom: 10px;
+}
+
+#repo-info {
+ margin-bottom: 20px;
+ font-weight: bold;
+}
+
+#settings-toggle, #start-fetch, #download-files #save-token #save-rules {
+ background-color: #ae5630;
+ color: white;
+ border: none;
+ padding: 10px 15px;
+ cursor: pointer;
+ margin-bottom: 20px;
+}
+
+#download-files {
+ margin-bottom: 20px;
+}
+.icon-button {
+ background: none;
+ border: none;
+ color: #ae5630;
+ cursor: pointer;
+}
+
+#settings-panel {
+ margin-bottom: 20px;
+}
+
+.mergyignore-section {
+ margin-bottom: 15px;
+}
+
+textarea, input[type="password"] {
+ width: 100%;
+ height: 60px;
+ margin-bottom: 10px;
+ background-color: #353533;
+ color: #ffffff;
+ border: 1px solid #ae5630;
+ padding: 5px;
+}
+input[type="password"] {
+ height: 30px;
+}
+
+button:disabled {
+ background-color: #666;
+ cursor: not-allowed;
+}
+
+#download-section {
+ margin-bottom: 20px;
+}
+
+#estimated-size {
+ margin-left: 10px;
+}
+
+#file-list {
+ max-height: 400px;
+ overflow-y: auto;
+}
+
+table {
+ width: 100%;
+ border-collapse: collapse;
+}
+
+th, td {
+ border: 1px solid #353533;
+ padding: 8px;
+ text-align: left;
+}
+
+th {
+ background-color: #21201c;
+}
+
+td:nth-child(2) {
+ white-space: nowrap;
+}
+
+td:nth-child(3), td:nth-child(4) {
+ max-width: 200px;
+ overflow: hidden;
+ text-overflow: ellipsis;
+ white-space: nowrap;
+}
+
+#loading {
+ text-align: center;
+ padding: 20px;
+}
+
+.spinner {
+ border: 4px solid #f3f3f3;
+ border-top: 4px solid #ae5630;
+ border-radius: 50%;
+ width: 40px;
+ height: 40px;
+ animation: spin 1s linear infinite;
+ margin: 0 auto;
+}
+
+@keyframes spin {
+ 0% { transform: rotate(0deg); }
+ 100% { transform: rotate(360deg); }
+}
+#footer {
+ margin-top: 20px;
+ text-align: center;
+ font-size: 0.9em;
+ color: #999;
+}
+
+#download-files {
+ display: flex;
+ align-items: center;
+}
+
+#download-files .material-icons {
+ margin-right: 5px;
+}
+
+.button-container {
+ display: flex;
+ justify-content: space-between;
+ align-items: center;
+ margin-bottom: 20px;
+}
+
+.primary-button {
+ background-color: #ae5630;
+ color: white;
+ border: none;
+ padding: 10px 15px;
+ cursor: pointer;
+ display: flex;
+ align-items: center;
+ justify-content: center;
+}
+
+.primary-button .material-icons,
+.primary-button .button-icon {
+ font-size: 30px;
+ width: 25px;
+ height: 25px;
+ margin-right: 5px;
+}
+
+.primary-button .button-icon {
+ object-fit: contain;
+}
+
+#estimated-size {
+ display: block;
+ text-align: right;
+ margin-top: 5px;
+}
+
+// File: Readme.md
+# Mergy
+
+Mergy is a Browser extension designed to easily aggregate GitHub repository contents into a single text file, perfect for use with Anthropic's Claude Projects feature, enabling seamless integration of entire codebases for AI-assisted development and analysis.
+
+## Features
+
+- Fetch files from any public GitHub repository
+- Customizable file inclusion/exclusion rules
+- Combine selected files into a single, downloadable text file
+- Respect .gitignore rules and support custom ignore patterns
+- User-friendly interface with file size estimates and selection options
+
+## Installation
+
+1. Download the extension from the Browser Web Store (link to be added once published)
+2. Click on "Add to Browser" to install the extension
+3. Once installed, you'll see the Mergy icon in your Chrome toolbar
+
+## Usage
+
+1. Navigate to any GitHub repository page
+2. Click on the Mergy icon in your Chrome toolbar
+3. Set your GitHub Personal Access Token in the settings (required for API access)
+4. Configure Mergy Ignore rules if desired (optional)
+5. Click "Start Fetching Files" to retrieve the repository contents
+6. Select the files you want to include in the combined file
+7. Click "Download Combined Files" to generate and download the aggregated text file
+
+## Configuration
+
+### GitHub Token
+
+To use this extension, you need to provide a GitHub Personal Access Token:
+
+1. Go to GitHub Settings > Developer settings > Personal access tokens
+2. Generate a new read-only token with 'repo' scope
+3. Copy the token and paste it into the extension's settings
+
+### MergyIgnore Rules
+
+You can customize which files to include or exclude using MergyIgnore rules:
+
+- Include if path contains: Specify paths to include
+- Include file extensions: List file extensions to include
+- Exclude if path contains: Specify paths to exclude
+- Exclude file extensions: List file extensions to exclude
+
+## Privacy and Security
+
+This extension requires a GitHub Personal Access Token to function. Your token is stored locally in your browser and is only used to authenticate API requests to GitHub. We do not collect or store any personal data.
+
+## Support
+
+For bug reports, feature requests, or general questions, please open an issue on our GitHub repository (link to be added).
+
+## Contributing
+
+We welcome contributions to the Mergy project. Please read our contributing guidelines (link to be added) before submitting pull requests.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+---
+
+Developed by Betalgo with ❤️ for Anthropic's Claude
+
+// File: content.js
+chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
+ if (request.action === "getRepoInfo") {
+ const repoInfo = extractRepoInfo();
+ sendResponse({repo: repoInfo});
+ }
+});
+
+function extractRepoInfo() {
+ const repoElement = document.querySelector('meta[name="octolytics-dimension-repository_nwo"]');
+ if (repoElement) {
+ const [owner, name] = repoElement.content.split('/');
+ return { owner, name };
+ }
+ return null;
+}
